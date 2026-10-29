@@ -1,5 +1,12 @@
 # Verbindliches Entwicklungsregister – MCM-SolarCheck
 
+### 29.10.2026 · DEV-CI-RGB-WIN-001 – neue Gesamtflug-Gates tatsächlich unter Windows ausführen
+- Ausschließlich Zielrepository `mcm-solarcheck2`, Branch `development/rgb-photogrammetry`; Referenzrepository `MCM-SolarCheck` ausschließlich lesend. Übernahmebasis `6b72e8f373c3eb8f61615916705699b048616531`; Übernahme-/Schutzanweisungen in `AGENTS.md` und `SOLARCHECK2_START.md`.
+- Befund: Die grüne Referenz-Windows-CI verwendete eine ältere explizite Dateiliste ohne die neuen SfM-/Kameragraph-/RTK-BA-Tests. Die Linux-Gesamtsuite enthielt sie bereits. Kein behaupteter Windows-Graph-Nachweis aus dem alten grünen Workflow.
+- Änderung: `.github/workflows/windows-offline.yml` startet auch auf dem Ziel-Entwicklungsbranch und führt als eigenen Schritt die sieben vorhandenen Dateien `test_rgb_sfm_link_graph_gate.py`, `test_rgb_zip_whole_flight_reconstruction.py`, `test_rgb_global_camera_network.py`, `test_rgb_global_bundle_adjustment.py`, `test_rgb_windowed_bundle_adjustment.py`, `test_rgb_rtk_camera_priors.py`, `test_rgb_rtk_joint_bundle_adjustment.py` unter Windows/Python 3.11 und 3.12 aus. Bestehende Desktop-/DPAPI-/Importtests und Smoke bleiben erhalten.
+- Lokale Einrichtungsevidenz: Die sieben Dateien enthalten 35 Tests und waren Bestandteil des erfolgreichen Python-3.12-Laufs mit insgesamt 37 bestandenen und 2 erwarteten nativen Windows-Skips. Native Windows-Ergebnisse sind getrennt über die Actions des neuen vollständigen HEAD zu prüfen; keinen Lauf vorab als grün bezeichnen.
+- Kein Anwendungscode geändert, kein Original-/SQLite-Zugriff, kein neuer 160-Bild-Lauf, kein Dach-/Orthofoto-/PV-/Thermal-Nachweis. Nach bestätigter Ziel-CI ist der vorhandene reale Gesamtfluglauf mit allen sechs Archiven und unabhängig verifizierter Kalibrierung die einzige nächste fachliche Aufgabe.
+
 ### 28.10.2026 · DEV-RGB-ORTHO-ENGINE-001 – geometrisches Ganzflug-Graph-Gate
 - PR #9, `main` bleibt unverändert. Bestehendes ZIP→SfM→RTK-BA und dessen vorherige Tests werden wiederverwendet, nicht wiederholt.
 - Neu: `rgb_sfm_link_graph_gate.py` analysiert den vollständigen Graphen aus durch kalibrierte Essential-Matrix-RANSAC / Pose akzeptierten RGB-Paaren, validiert tatsächliche ORB-Match-Provenienz, prüft Zusammenhang aller Kamera-IDs und fordert mindestens 2 geometrisch akzeptierte räumlich nicht benachbarte Verbindungen mit mindestens 3 beteiligten Kameras. Iterativer DFS-Bridge-Audit für bis zu 1.000 Bilder, Kantenbrücken nur als Qualitätsdiagnose.
