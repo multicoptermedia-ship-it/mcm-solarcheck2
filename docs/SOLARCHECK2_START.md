@@ -24,6 +24,12 @@ Alle drei PRs waren weiterhin Draft/offen. Python- und Windows-Matrizen verwende
 
 Lokal im Zielcheckout wurden die bestehenden RGB-/SfM-/Graph-/BA-/RTK- und Offline-Starttests unter Python 3.12 ausgeführt: **37 bestanden, 2 native Windows-Tests unter Linux übersprungen**. `pip check` und der Offline-Desktop-Smoke mit temporärer SQLite und gesperrten Python-Netzwerkverbindungen waren erfolgreich. Der positive Ganzflug-Integrationstest ersetzt ORB/SfM/BA durch Test-Doubles; daraus folgt keine echte 160-Bild-Rekonstruktion.
 
+## CI im Zielrepository ausführen
+
+Nach dem Push von `da84e56a42c9484981bbfc5ef31819d6f85d7e8d` wurden der Windows- und der Python-Workflow von GitHub erkannt; auf der Actions-Seite waren bisher 0 gestartete Läufe und keine Commit-Checks sichtbar. Die Ursache ist nicht belegt. Die beiden YAML-Dateien unterstützen nun einen gezielten manuellen Start auf `development/rgb-photogrammetry`. Nach einem tatsächlich erfolgreichen Lauf die vollständige HEAD-Zuordnung und beide Python-Versionen prüfen; die alten Referenz-Läufe ersetzen diesen Beleg nicht.
+
+Für die API-basierte Diagnose und einen gezielten Dispatch wird `api.github.com` benötigt. Der vorhandene Git-Zugriff funktioniert, der API-Zugriff ist derzeit am Cloud-Netzwerkfilter blockiert; daraus folgt kein fehlendes GitHub-Token. Alternativ können die beiden Workflows in der GitHub-Actions-Oberfläche des Zielrepositorys auf dem Entwicklungsbranch gestartet werden. Keine GitHub-Einstellungen auf Verdacht ändern, keine Tests deaktivieren und keine leeren Wiederholungscommits erzeugen.
+
 ## Cloud-Entwicklung starten
 
 Die Cloud-Umgebung speichert das vollständige getestete Installationsskript und die Startanweisungen in ihrer Konfiguration. In der eingerichteten Maschine:
