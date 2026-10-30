@@ -247,3 +247,99 @@ def test_geometrically_marked_cycles_cannot_silently_discard_contradictory_track
     ))
     with pytest.raises(ValueError, match="contradictory multiview"):
         solve_global_rgb_camera_network(frames, tuple(corrupt), k)
+
+
+def test_global_triplet_bootstrap_can_pose_camera_zero_after_other_cameras():
+    """Actual projection/Essential/PnP with changing visibility, no pose doubles.
+
+    The strongest edge touching camera zero sees only two-view points. A
+    different three-camera seed reconstructs points that camera zero can use
+    later; input order must not make a connected valid reconstruction fail.
+    """
+    rng = np.random.default_rng(20261030)
+    sizes = (80, 30, 160)
+    xyz = np.column_stack((
+        rng.uniform(-2., 2., sum(sizes)),
+        rng.uniform(-1.5, 1.5, sum(sizes)),
+        rng.uniform(6., 12., sum(sizes)),
+    ))
+    a = set(range(80))
+    b = set(range(80, 110))
+    c = set(range(110, 270))
+    visible = (a | b, a | c, b | c, b | c)
+    k = PinholeIntrinsics(740., 740., 400., 300.)
+    centers = np.array(((0., 0., 0.), (.6, -.1, .05),
+                        (1.2, .1, -.05), (1.8, -.1, .1)))
+    frames = []
+    local_indices = []
+    for i, world_ids in enumerate(visible):
+        ordered = sorted(world_ids)
+        local_indices.append({world: local for local, world in enumerate(ordered)})
+        camera = xyz[ordered] - centers[i]
+        pixels = np.column_stack((k.fx*camera[:, 0]/camera[:, 2]+k.cx,
+                                  k.fy*camera[:, 1]/camera[:, 2]+k.cy))
+        frames.append(RGBNetworkFrame(f"visibility-{i}", pixels))
+    links = []
+    for i in range(4):
+        for j in range(i+1, 4):
+            shared = sorted(visible[i] & visible[j])
+            links.append(RGBNetworkLink(
+                frames[i].frame_id, frames[j].frame_id,
+                np.array([(local_indices[i][world], local_indices[j][world])
+                          for world in shared], dtype=np.int32),
+            ))
+    original_pixels = tuple(frame.points_xy.copy() for frame in frames)
+    ticks = []
+    cv2.setRNGSeed(20261030)
+    result = solve_global_rgb_camera_network(
+        tuple(frames), tuple(links), k, on_progress=lambda *tick: ticks.append(tick),
+    )
+    assert result.frame_ids == tuple(frame.frame_id for frame in frames)
+    assert len(result.world_to_camera) == 4
+    assert result.reconstructed_landmarks >= 200
+    np.testing.assert_array_equal(
+        result.world_to_camera[0], np.column_stack((np.eye(3), np.zeros(3))),
+    )
+    # The actual initial accepted triplet lacks camera zero: only the 30
+    # group-B points can subsequently pose it, despite the 80-point dead end.
+    assert any(tick[0] == "bootstrap" for tick in ticks)
+    assert [tick for tick in ticks if tick[0] == "poses"][0][1] == 3
+    fid, lid = result.observation_frame_indices, result.observation_landmark_indices
+    poses = np.asarray(result.world_to_camera)
+    camera = np.einsum("nij,nj->ni", poses[fid, :, :3],
+                       result.landmark_xyz_unit_baseline[lid]) + poses[fid, :, 3]
+    assert np.all(camera[:, 2] > 0.)
+    projected = np.column_stack((k.fx*camera[:, 0]/camera[:, 2]+k.cx,
+                                 k.fy*camera[:, 1]/camera[:, 2]+k.cy))
+    error = np.linalg.norm(projected-result.observation_pixels_xy, axis=1)
+    assert error.max() < 3.
+    assert set(fid) == {0, 1, 2, 3}
+    for frame, before in zip(frames, original_pixels):
+        np.testing.assert_array_equal(frame.points_xy, before)
+    assert not result.metric_scale_verified and not result.orthophoto_verified
+
+
+def test_camera_zero_reframe_preserves_all_camera_space_points_and_projections():
+    from mcm_solarcheck.services.rgb_global_camera_network import _reframe_camera_zero
+
+    rotations = ((.1, -.2, .05), (-.05, .12, -.1), (.03, -.04, .2))
+    translations = ((.7, -.2, .1), (-.3, .15, .2), (.2, .3, -.1))
+    poses = {i: np.column_stack((cv2.Rodrigues(np.array(r))[0], t))
+             for i, (r, t) in enumerate(zip(rotations, translations))}
+    points = {0: np.array((.2, -.1, 8.)), 1: np.array((-.3, .5, 10.))}
+    before_poses = {i: value.copy() for i, value in poses.items()}
+    before_points = {i: value.copy() for i, value in points.items()}
+    reframed, transformed = _reframe_camera_zero(poses, points)
+    np.testing.assert_array_equal(
+        reframed[0], np.column_stack((np.eye(3), np.zeros(3))),
+    )
+    for i, pose in poses.items():
+        for j, point in points.items():
+            before = pose[:, :3] @ point + pose[:, 3]
+            after = reframed[i][:, :3] @ transformed[j] + reframed[i][:, 3]
+            np.testing.assert_allclose(after, before, rtol=1e-14, atol=1e-14)
+            np.testing.assert_allclose(after[:2]/after[2], before[:2]/before[2],
+                                       rtol=1e-14, atol=1e-14)
+        np.testing.assert_array_equal(pose, before_poses[i])
+    for i, point in points.items():
+        np.testing.assert_array_equal(point, before_points[i])

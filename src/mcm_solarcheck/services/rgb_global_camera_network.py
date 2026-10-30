@@ -108,6 +108,48 @@ def _triangulate(track, poses, frames, k, *, max_reprojection_px):
     return xyz
 
 
+def _estimate_supported_pnp_pose(observations, k, *, min_inliers, max_reprojection_px):
+    """One actual PnP solve with positive-depth, post-refinement pixel support."""
+    xyz = np.array([x for x, _ in observations], dtype=np.float64)
+    pixels = np.array([y for _, y in observations], dtype=np.float64)
+    success, rot, translation, inliers = cv2.solvePnPRansac(
+        xyz, pixels, k, None, iterationsCount=300,
+        reprojectionError=max_reprojection_px, confidence=.999,
+        flags=cv2.SOLVEPNP_EPNP,
+    )
+    if not success or inliers is None or len(inliers) < min_inliers:
+        return None
+    selected = inliers.reshape(-1)
+    rot, translation = cv2.solvePnPRefineLM(
+        xyz[selected], pixels[selected], k, None, rot, translation,
+    )
+    matrix = np.column_stack((cv2.Rodrigues(rot)[0], translation.reshape(3)))
+    if not np.isfinite(matrix).all():
+        return None
+    supported = 0
+    for index in selected:
+        projected = _project(matrix, xyz[index], k)
+        if (projected is not None and
+                np.linalg.norm(projected-pixels[index]) <= max_reprojection_px):
+            supported += 1
+    return matrix if supported >= min_inliers else None
+
+
+def _reframe_camera_zero(poses, landmarks):
+    """Change only the arbitrary gauge, preserving every camera-space point."""
+    rotation = poses[0][:, :3]
+    translation = poses[0][:, 3]
+    reframed = {}
+    for index, pose in poses.items():
+        r = pose[:, :3] @ rotation.T
+        t = pose[:, 3] - r @ translation
+        reframed[index] = np.column_stack((r, t))
+    reframed[0] = np.column_stack((np.eye(3), np.zeros(3)))
+    points = {index: rotation @ point + translation
+              for index, point in landmarks.items()}
+    return reframed, points
+
+
 def solve_global_rgb_camera_network(
     frames: tuple[RGBNetworkFrame, ...],
     links: tuple[RGBNetworkLink, ...],
@@ -239,100 +281,106 @@ def solve_global_rgb_camera_network(
     if len(multi)<min_inliers:
         raise ValueError("insufficient shared three-view RGB feature tracks")
 
-    # Anchor one arbitrary baseline. No external scale or world datum!
-    roots=[v for v in accepted if v[0]==0 or v[1]==0]
-    if not roots:
-        raise ValueError("first camera lacks calibrated network baseline")
-    first=max(roots,key=lambda x:len(x[4]))
-    i,j,r,t,_=first
-    identity=np.column_stack((np.eye(3),np.zeros(3)))
-    if i==0:
-        other=j
-        second=np.column_stack((r,t))
-    else:
-        other=i
-        inv_r=r.T
-        second=np.column_stack((inv_r,-inv_r@t))
-    poses={0:identity,other:second}
-    landmarks={}
+    # An input's first camera need not be a geometrically usable bootstrap.
+    # Keep every input camera, but search a bounded set of global baselines
+    # for an actual supported third view before committing to the seed.
     tracks_by_frame = [[] for _ in frames]
     for track_index, track in enumerate(tracks):
         for frame_index in track:
             tracks_by_frame[frame_index].append(track_index)
+    poses = {}
+    landmarks = {}
+
     def retriangulate(changed_frame=None):
         # Existing poses never change during this initialization. Adding a
-        # camera can affect only tracks observed in that camera; re-solving
-        # unrelated tracks at every image is identical work on large flights.
+        # camera affects only tracks observed in that camera.
         indices = (range(len(tracks)) if changed_frame is None
                    else tracks_by_frame[changed_frame])
         for index in indices:
             cancel()
             track = tracks[index]
-            if len(track)<2:
+            if len(track) < 2:
                 continue
-            xyz=_triangulate(track,poses,frames,k,max_reprojection_px=max_reprojection_px)
+            xyz = _triangulate(track, poses, frames, k,
+                               max_reprojection_px=max_reprojection_px)
             if xyz is not None:
-                landmarks[index]=xyz
+                landmarks[index] = xyz
             else:
-                landmarks.pop(index,None)
-    retriangulate()
-    if on_progress is not None:
-        on_progress("poses", len(poses), len(frames))
-    for _ in range(len(frames)-2):
-        cancel()
-        if len(poses)==len(frames):
-            break
-        candidates=[]
-        for frame_index in range(len(frames)):
+                landmarks.pop(index, None)
+
+    def pose_candidates():
+        # Inverted track lookup avoids scanning the whole feature graph for
+        # every unposed image at every reconstruction step.
+        candidates = []
+        for frame_index, indices in enumerate(tracks_by_frame):
             if frame_index in poses:
                 continue
-            correspondences=[
-                (landmarks[index],frames[frame_index].points_xy[track[frame_index]])
-                for index,track in enumerate(tracks) if frame_index in track and index in landmarks
+            observations = [
+                (landmarks[index], frames[frame_index].points_xy[
+                    tracks[index][frame_index]])
+                for index in indices if index in landmarks
             ]
-            if len(correspondences)>=min_inliers:
-                candidates.append((len(correspondences),frame_index,correspondences))
+            if len(observations) >= min_inliers:
+                candidates.append((len(observations), frame_index, observations))
+        return sorted(candidates, key=lambda item: -item[0])
+
+    def supported_next_pose(candidates):
+        for _, frame_index, observations in candidates:
+            cancel()
+            matrix = _estimate_supported_pnp_pose(
+                observations, k, min_inliers=min_inliers,
+                max_reprojection_px=max_reprojection_px,
+            )
+            if matrix is not None:
+                return frame_index, matrix
+        return None
+
+    seeds = sorted(accepted, key=lambda item: -len(item[4]))[:64]
+    for seed_index, (i, j, r, t, _) in enumerate(seeds):
+        cancel()
+        if on_progress is not None:
+            on_progress("bootstrap", seed_index+1, len(seeds))
+        poses = {i: np.column_stack((np.eye(3), np.zeros(3))),
+                 j: np.column_stack((r, t))}
+        landmarks = {}
+        retriangulate(i)
+        added = supported_next_pose(pose_candidates())
+        if added is None:
+            continue
+        third, matrix = added
+        poses[third] = matrix
+        retriangulate(third)
+        # The accepted PnP observations must also survive the SAME original
+        # triangulation gate in the complete initial three-camera bundle.
+        if all(sum(index in landmarks for index in tracks_by_frame[frame])
+               >= min_inliers for frame in poses):
+            break
+    else:
+        raise ValueError("disconnected or underconstrained RGB camera network: "
+                         "bootstrap PnP poses have insufficient 3D support")
+
+    if on_progress is not None:
+        on_progress("poses", len(poses), len(frames))
+    for _ in range(len(frames)-len(poses)):
+        cancel()
+        candidates = pose_candidates()
         if not candidates:
             break
-        # Correspondence count alone cannot establish a usable camera pose.
-        # Try the remaining supported cameras before declaring the network
-        # underconstrained. A failed candidate may gain reliable 3D support
-        # after a different camera has been added; never discard its image.
-        added = None
-        for _,frame_index,observations in sorted(candidates, key=lambda item:-item[0]):
-            cancel()
-            xyz=np.array([x for x,_ in observations],dtype=np.float64)
-            pixels=np.array([y for _,y in observations],dtype=np.float64)
-            success,rot,translation,inliers=cv2.solvePnPRansac(
-                xyz,pixels,k,None,iterationsCount=300,
-                reprojectionError=max_reprojection_px,confidence=.999,
-                flags=cv2.SOLVEPNP_EPNP,
-            )
-            if not success or inliers is None or len(inliers)<min_inliers:
-                continue
-            selected=inliers.reshape(-1)
-            rot,translation=cv2.solvePnPRefineLM(xyz[selected],pixels[selected],k,None,rot,translation)
-            matrix=np.column_stack((cv2.Rodrigues(rot)[0],translation.reshape(3)))
-            if not np.isfinite(matrix).all():
-                continue
-            supported_points = 0
-            for index in selected:
-                projected = _project(matrix, xyz[index], k)
-                if (projected is not None and
-                        np.linalg.norm(projected-pixels[index]) <= max_reprojection_px):
-                    supported_points += 1
-            if supported_points >= min_inliers:
-                added = (frame_index, matrix)
-                break
+        # Failed candidates can gain support after another camera is added;
+        # their images remain mandatory in the final complete network.
+        added = supported_next_pose(candidates)
         if added is None:
             raise ValueError("global camera PnP poses have insufficient 3D support")
-        frame_index,matrix = added
-        poses[frame_index]=matrix
+        frame_index, matrix = added
+        poses[frame_index] = matrix
         retriangulate(frame_index)
         if on_progress is not None:
             on_progress("poses", len(poses), len(frames))
-    if len(poses)!=len(frames):
+    if len(poses) != len(frames):
         raise ValueError("disconnected or underconstrained RGB camera network")
+    # Downstream unscaled consumers retain camera zero as the identity datum,
+    # even when it was reconstructed after a different seed triplet.
+    poses, landmarks = _reframe_camera_zero(poses, landmarks)
     errors=[]
     participating=set()
     supported={index:0 for index in range(len(frames))}
