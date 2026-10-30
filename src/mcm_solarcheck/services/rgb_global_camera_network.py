@@ -55,6 +55,9 @@ class RGBUnscaledNetwork:
     # Pairs that survived calibrated essential-matrix RANSAC and pose recovery;
     # these are geometric link candidates, NOT independent roof/strip proof.
     accepted_link_pairs: tuple[tuple[str, str], ...] = ()
+    # Strictly internal feature provenance; counts alone are reportable.
+    rejected_conflicting_track_merges: int = 0
+    accepted_geometric_feature_correspondences: int = 0
 
 
 def _project(pose, point, k):
@@ -115,6 +118,7 @@ def solve_global_rgb_camera_network(
     max_frames: int = 1000,
     max_track_count: int = 40000,
     should_cancel=None,
+    on_progress=None,
 ) -> RGBUnscaledNetwork:
     """Use all supplied frames; never return a partial or metric camera network.
 
@@ -160,17 +164,23 @@ def solve_global_rgb_camera_network(
     def join(a,b):
         ra, rb = find(a), find(b)
         if ra == rb:
-            return
+            return True
         if owners[ra].keys() & owners[rb].keys():
-            return
+            # These components already claim different ORB keypoints from
+            # the same RGB frame. Silently ignoring this edge would let a
+            # geometrically accepted pair masquerade as valid 3D track proof.
+            return False
         if len(owners[ra]) < len(owners[rb]):
             ra,rb = rb,ra
         parent[rb] = ra
         owners[ra].update(owners.pop(rb))
+        return True
     accepted = []
     used_pairs = set()
-    for link in links:
+    for pair_index, link in enumerate(links):
         cancel()
+        if on_progress is not None:
+            on_progress("geometry", pair_index + 1, len(links))
         if (not isinstance(link, RGBNetworkLink) or link.first_id not in ids
                 or link.second_id not in ids or link.first_id == link.second_id):
             raise ValueError("network link references unknown or duplicate image")
@@ -188,6 +198,9 @@ def solve_global_rgb_camera_network(
             raise ValueError("bounded valid feature correspondence indices required")
         if len(set(map(tuple,indices.tolist()))) != len(indices):
             raise ValueError("duplicate feature correspondence in RGB pair")
+        if (len(np.unique(indices[:, 0])) != len(indices)
+                or len(np.unique(indices[:, 1])) != len(indices)):
+            raise ValueError("ambiguous one-to-many feature correspondence in RGB pair")
         pi,pj = frames[i].points_xy[indices[:,0]], frames[j].points_xy[indices[:,1]]
         e,mask = cv2.findEssentialMat(pi,pj,k,cv2.RANSAC,0.999,max_reprojection_px)
         if e is None or mask is None or len(e) < 3:
@@ -201,11 +214,24 @@ def solve_global_rgb_camera_network(
     if not accepted:
         raise ValueError("no calibrated multi-image essential geometry")
     # All pair links feed one GLOBAL track graph, not separate mosaics.
+    # A conflicting pair of multi-frame feature tracks is NEVER merged.
+    # If a geometric pair contradicts the existing track graph on too many
+    # correspondences, it cannot count as reliable multi-view evidence.
+    conflicts = 0
+    geometric_correspondences = 0
     for i,j,_,_,match_indices in sorted(accepted,key=lambda v:-len(v[4])):
+        pair_conflicts = 0
+        geometric_correspondences += len(match_indices)
         for a,b in match_indices:
-            join((i,int(a)),(j,int(b)))
+            if not join((i,int(a)),(j,int(b))):
+                pair_conflicts += 1
             if len(parent)>max_track_count*5:
                 raise ValueError("RGB feature graph exceeds track resource budget")
+        conflicts += pair_conflicts
+        if pair_conflicts * 3 > len(match_indices):
+            raise ValueError("contradictory multiview RGB feature track associations")
+    if conflicts * 3 > geometric_correspondences:
+        raise ValueError("contradictory global RGB multiview feature tracks")
     tracks = list(owners.values())
     if len(tracks)>max_track_count:
         raise ValueError("RGB network exceeds landmark budget")
@@ -229,9 +255,19 @@ def solve_global_rgb_camera_network(
         second=np.column_stack((inv_r,-inv_r@t))
     poses={0:identity,other:second}
     landmarks={}
-    def retriangulate():
-        for index,track in enumerate(tracks):
+    tracks_by_frame = [[] for _ in frames]
+    for track_index, track in enumerate(tracks):
+        for frame_index in track:
+            tracks_by_frame[frame_index].append(track_index)
+    def retriangulate(changed_frame=None):
+        # Existing poses never change during this initialization. Adding a
+        # camera can affect only tracks observed in that camera; re-solving
+        # unrelated tracks at every image is identical work on large flights.
+        indices = (range(len(tracks)) if changed_frame is None
+                   else tracks_by_frame[changed_frame])
+        for index in indices:
             cancel()
+            track = tracks[index]
             if len(track)<2:
                 continue
             xyz=_triangulate(track,poses,frames,k,max_reprojection_px=max_reprojection_px)
@@ -240,6 +276,8 @@ def solve_global_rgb_camera_network(
             else:
                 landmarks.pop(index,None)
     retriangulate()
+    if on_progress is not None:
+        on_progress("poses", len(poses), len(frames))
     for _ in range(len(frames)-2):
         cancel()
         if len(poses)==len(frames):
@@ -256,23 +294,43 @@ def solve_global_rgb_camera_network(
                 candidates.append((len(correspondences),frame_index,correspondences))
         if not candidates:
             break
-        _,frame_index,observations=max(candidates,key=lambda item:item[0])
-        xyz=np.array([x for x,_ in observations],dtype=np.float64)
-        pixels=np.array([y for _,y in observations],dtype=np.float64)
-        success,rot,translation,inliers=cv2.solvePnPRansac(
-            xyz,pixels,k,None,iterationsCount=300,
-            reprojectionError=max_reprojection_px,confidence=.999,
-            flags=cv2.SOLVEPNP_EPNP,
-        )
-        if not success or inliers is None or len(inliers)<min_inliers:
-            raise ValueError("global camera PnP pose has insufficient 3D support")
-        selected=inliers.reshape(-1)
-        rot,translation=cv2.solvePnPRefineLM(xyz[selected],pixels[selected],k,None,rot,translation)
-        matrix=np.column_stack((cv2.Rodrigues(rot)[0],translation.reshape(3)))
-        if not np.isfinite(matrix).all():
-            raise ValueError("nonfinite RGB network camera pose")
+        # Correspondence count alone cannot establish a usable camera pose.
+        # Try the remaining supported cameras before declaring the network
+        # underconstrained. A failed candidate may gain reliable 3D support
+        # after a different camera has been added; never discard its image.
+        added = None
+        for _,frame_index,observations in sorted(candidates, key=lambda item:-item[0]):
+            cancel()
+            xyz=np.array([x for x,_ in observations],dtype=np.float64)
+            pixels=np.array([y for _,y in observations],dtype=np.float64)
+            success,rot,translation,inliers=cv2.solvePnPRansac(
+                xyz,pixels,k,None,iterationsCount=300,
+                reprojectionError=max_reprojection_px,confidence=.999,
+                flags=cv2.SOLVEPNP_EPNP,
+            )
+            if not success or inliers is None or len(inliers)<min_inliers:
+                continue
+            selected=inliers.reshape(-1)
+            rot,translation=cv2.solvePnPRefineLM(xyz[selected],pixels[selected],k,None,rot,translation)
+            matrix=np.column_stack((cv2.Rodrigues(rot)[0],translation.reshape(3)))
+            if not np.isfinite(matrix).all():
+                continue
+            supported_points = 0
+            for index in selected:
+                projected = _project(matrix, xyz[index], k)
+                if (projected is not None and
+                        np.linalg.norm(projected-pixels[index]) <= max_reprojection_px):
+                    supported_points += 1
+            if supported_points >= min_inliers:
+                added = (frame_index, matrix)
+                break
+        if added is None:
+            raise ValueError("global camera PnP poses have insufficient 3D support")
+        frame_index,matrix = added
         poses[frame_index]=matrix
-        retriangulate()
+        retriangulate(frame_index)
+        if on_progress is not None:
+            on_progress("poses", len(poses), len(frames))
     if len(poses)!=len(frames):
         raise ValueError("disconnected or underconstrained RGB camera network")
     errors=[]
@@ -330,4 +388,6 @@ def solve_global_rgb_camera_network(
         accepted_link_pairs=tuple(
             (frame_ids[i], frame_ids[j]) for i, j, _, _, _ in accepted
         ),
+        rejected_conflicting_track_merges=conflicts,
+        accepted_geometric_feature_correspondences=geometric_correspondences,
     )

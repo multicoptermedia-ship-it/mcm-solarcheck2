@@ -41,7 +41,7 @@ jobs:
           OPENBLAS_NUM_THREADS: '2'
           OMP_NUM_THREADS: '2'
         run: |
-          python -m pytest -q tests/test_rgb_sfm_link_graph_gate.py tests/test_rgb_zip_whole_flight_reconstruction.py tests/test_rgb_global_camera_network.py tests/test_rgb_global_bundle_adjustment.py tests/test_rgb_windowed_bundle_adjustment.py tests/test_rgb_rtk_camera_priors.py tests/test_rgb_rtk_joint_bundle_adjustment.py
+          python -m pytest -q tests/test_rgb_per_camera_reprojection_gate.py tests/test_rgb_multiview_parallax_gate.py tests/test_rgb_sfm_track_support_gate.py tests/test_rgb_private_pitched_plane_candidates.py tests/test_rgb_private_pitched_plane_orthorectification.py tests/test_rgb_private_multi_plane_preview.py tests/test_rgb_camera_initialization.py tests/test_rgb_focal_bundle_refinement.py tests/test_rgb_reconstructed_surface_candidate.py tests/test_rgb_flight_surface_output.py tests/test_rgb_sfm_link_graph_gate.py tests/test_rgb_zip_whole_flight_reconstruction.py tests/test_rgb_global_camera_network.py tests/test_rgb_global_bundle_adjustment.py tests/test_rgb_windowed_bundle_adjustment.py tests/test_rgb_rtk_camera_priors.py tests/test_rgb_rtk_joint_bundle_adjustment.py
       - name: Test real Windows DPAPI and local desktop/admin boundaries
         shell: pwsh
         env:

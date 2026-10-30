@@ -43,6 +43,9 @@ class RGBWindowedBAResult:
     weighted_objective_after: float | None = None
     rtk_windows_with_updates: int = 0
     rtk_windows_without_improvement: int = 0
+    refined_intrinsics: PinholeIntrinsics | None = None
+    focal_refined: bool = False
+    focal_reference_intrinsics: PinholeIntrinsics | None = None
 
 
 def _camera_windows(count, size, overlap):
@@ -96,6 +99,8 @@ def adjust_windowed_unscaled_rgb_network(
     rtk_camera_sigmas_m=None,
     rtk_fit_mask=None,
     gnss_huber_sigma=3.,
+    refine_focal: bool = False,
+    focal_reference_intrinsics: PinholeIntrinsics | None = None,
 ) -> RGBWindowedBAResult:
     """Refine every image's pose using existing *unscaled* multi-view tracks.
 
@@ -110,8 +115,9 @@ def adjust_windowed_unscaled_rgb_network(
             raise RuntimeError("whole-flight RGB bundle adjustment cancelled")
     cancel()
     if not isinstance(network, RGBUnscaledNetwork) or not isinstance(intrinsics, PinholeIntrinsics):
-        raise TypeError("existing SfM multi-view network and calibrated camera required")
-    if (type(window_cameras) is not int or not 3 <= window_cameras <= 24
+        raise TypeError("existing SfM multi-view network and pinhole camera required")
+    if (type(refine_focal) is not bool
+            or type(window_cameras) is not int or not 3 <= window_cameras <= 24
             or type(overlap_cameras) is not int
             or not 2 <= overlap_cameras < window_cameras - 1
             or type(max_window_landmarks) is not int
@@ -183,6 +189,17 @@ def adjust_windowed_unscaled_rgb_network(
         initial, cameras, centers, sigmas, fit, gnss_huber_sigma,
     )
     global_current = global_before
+    current_intrinsics = intrinsics
+    focal_reference = intrinsics if focal_reference_intrinsics is None else focal_reference_intrinsics
+    if refine_focal and (not isinstance(focal_reference, PinholeIntrinsics)
+            or not np.isfinite([focal_reference.fx,focal_reference.fy,
+                                focal_reference.cx,focal_reference.cy]).all()
+            or min(focal_reference.fx,focal_reference.fy) <= 0
+            or not .5-1.e-12 <= intrinsics.fx/focal_reference.fx <= 2.+1.e-12
+            or not np.isclose(intrinsics.fx/intrinsics.fy,
+                              focal_reference.fx/focal_reference.fy, rtol=1.e-12)
+            or (intrinsics.cx,intrinsics.cy) != (focal_reference.cx,focal_reference.cy)):
+        raise ValueError("consistent bounded original focal reference required")
     windows=list(_camera_windows(camera_count,min(window_cameras,camera_count),overlap_cameras))
     if len(windows) > 512:
         raise ValueError("whole-flight RGB BA exceeds window budget")
@@ -234,17 +251,27 @@ def adjust_windowed_unscaled_rgb_network(
             observation_pixels_xy=xy[selected_indices].copy(),
         )
         fit_options = {}
+        if refine_focal:
+            # Keep one common camera model within the ORIGINAL flight-wide
+            # interval; a new window must not multiply the allowed range.
+            fit_options.update(
+                refine_focal=True,
+                focal_scale_bounds=(
+                    float(min(1., .5*focal_reference.fx/current_intrinsics.fx)),
+                    float(max(1., 2.*focal_reference.fx/current_intrinsics.fx)),
+                ),
+            )
         if use_gnss:
             if np.count_nonzero(fit[numbers]) < 3:
                 raise ValueError("insufficient independent GNSS priors for RGB window")
-            fit_options = dict(
+            fit_options.update(
                 camera_center_priors_m=centers[numbers],
                 camera_center_sigma_m=sigmas[numbers],
                 camera_prior_fit_mask=fit[numbers],
                 gnss_huber_sigma=gnss_huber_sigma,
             )
         fitted=adjust_unscaled_rgb_bundle(
-            sub,intrinsics,max_iterations=max_iterations,
+            sub,current_intrinsics,max_iterations=max_iterations,
             max_cameras=len(numbers),max_landmarks=max_window_landmarks,
             max_observations=max_window_observations,
             should_cancel=should_cancel,**fit_options,
@@ -253,31 +280,53 @@ def adjust_windowed_unscaled_rgb_network(
         proposal_points=landmarks.copy()
         proposal_cameras[numbers] = np.stack(fitted.world_to_camera)
         proposal_points[original_points]=fitted.landmark_xyz_unit_baseline
-        new_errors=_all_network_errors(
-            proposal_cameras,proposal_points,fid,lid,xy,intrinsics,
-        )
-        old_errors=_all_network_errors(cameras,landmarks,fid,lid,xy,intrinsics)
+        proposal_intrinsics = (fitted.refined_intrinsics if refine_focal
+                               else current_intrinsics)
+        if proposal_intrinsics is None:
+            raise ValueError("focal-refining RGB window did not return camera intrinsics")
+        old_errors=_all_network_errors(cameras,landmarks,fid,lid,xy,current_intrinsics)
+        try:
+            new_errors=_all_network_errors(
+                proposal_cameras,proposal_points,fid,lid,xy,proposal_intrinsics,
+            )
+        except ValueError:
+            if not refine_focal:
+                raise
+            new_errors = np.full(len(fid), np.inf)
         # Every candidate is audited against ALL tracks and ALL non-withheld
         # GNSS camera centers. Pixel-only regression is preserved for old mode.
         new_global = _whole_flight_robust_objective(
             new_errors, proposal_cameras, centers, sigmas, fit, gnss_huber_sigma,
         )
-        if use_gnss:
-            if new_global > global_current + 1e-8:
+        if use_gnss or refine_focal:
+            if (new_global > global_current + 1e-8 or
+                    (not use_gnss and np.mean(new_errors**2) > np.mean(old_errors**2) + 1.e-9)):
                 # Shared landmarks occur OUTSIDE this window. A local Schur
                 # minimizer is not necessarily a descent direction for the
                 # full-flight objective; backtrack both pose and landmark
                 # increments, and fall back to pose-only/point-only steps.
                 # Never accept a local improvement that hurts other frames.
                 accepted = False
-                for variant in ("both", "poses", "points"):
+                variants = (("both", "geometry", "poses", "points", "focal")
+                            if refine_focal else ("both", "poses", "points"))
+                for variant in variants:
                     if accepted:
                         break
                     for alpha in (.5, .25, .125, .0625, .03125, .015625):
                         cancel()
                         trial_cameras = cameras.copy()
                         trial_points = landmarks.copy()
-                        if variant != "points":
+                        trial_intrinsics = current_intrinsics
+                        if refine_focal and variant in ("both", "focal"):
+                            focal_ratio = float(np.exp(alpha*np.log(
+                                proposal_intrinsics.fx/current_intrinsics.fx
+                            )))
+                            trial_intrinsics = PinholeIntrinsics(
+                                current_intrinsics.fx*focal_ratio,
+                                current_intrinsics.fy*focal_ratio,
+                                current_intrinsics.cx,current_intrinsics.cy,
+                            )
+                        if variant not in ("points", "focal"):
                             for cam_id in numbers:
                                 old_pose = cameras[cam_id]
                                 target = proposal_cameras[cam_id]
@@ -291,7 +340,7 @@ def adjust_windowed_unscaled_rgb_network(
                                     old_pose[:, 3] +
                                     alpha * (target[:, 3] - old_pose[:, 3])
                                 )
-                        if variant != "poses":
+                        if variant not in ("poses", "focal"):
                             trial_points[original_points] = (
                                 landmarks[original_points] +
                                 alpha * (proposal_points[original_points] -
@@ -300,7 +349,7 @@ def adjust_windowed_unscaled_rgb_network(
                         try:
                             trial_errors = _all_network_errors(
                                 trial_cameras, trial_points, fid, lid, xy,
-                                intrinsics,
+                                trial_intrinsics,
                             )
                         except ValueError:
                             continue
@@ -308,11 +357,13 @@ def adjust_windowed_unscaled_rgb_network(
                             trial_errors, trial_cameras,
                             centers, sigmas, fit, gnss_huber_sigma,
                         )
-                        if trial_global < global_current - 1.e-10:
+                        if (trial_global < global_current - 1.e-10 and
+                                (use_gnss or np.mean(trial_errors**2) <= np.mean(old_errors**2) + 1.e-9)):
                             proposal_cameras, proposal_points = (
                                 trial_cameras, trial_points,
                             )
                             new_errors, new_global = trial_errors, trial_global
+                            proposal_intrinsics = trial_intrinsics
                             accepted = True
                             break
                 if not accepted:
@@ -330,13 +381,14 @@ def adjust_windowed_unscaled_rgb_network(
             updates += 1
         global_current = new_global
         cameras,landmarks=proposal_cameras,proposal_points
+        current_intrinsics = proposal_intrinsics
         completed+=1
         if on_progress is not None:
             on_progress(completed,len(windows),len(numbers))
     cancel()
     if touched!=set(range(camera_count)):
         raise ValueError("whole-flight RGB BA left camera frames unprocessed")
-    final=_all_network_errors(cameras,landmarks,fid,lid,xy,intrinsics)
+    final=_all_network_errors(cameras,landmarks,fid,lid,xy,current_intrinsics)
     after=float(np.sqrt(np.mean(final**2)))
     after_p95=float(np.percentile(final,95))
     if not use_gnss and after > before + 1e-8:
@@ -351,7 +403,9 @@ def adjust_windowed_unscaled_rgb_network(
         result_poses,result_points,before,after,before_p95,after_p95,
         camera_count,len(result_points),len(fid),completed,
         min(window_cameras,camera_count),
-        status=("rtk_regularized_windows_with_rejections_unverified"
+        status=("windowed_rgb_ba_with_rejections_unscaled_unverified"
+                if refine_focal and without_improvement and not use_gnss else
+                "rtk_regularized_windows_with_rejections_unverified"
                 if use_gnss and without_improvement else
                 "rtk_regularized_windowed_rgb_ba_candidate_unverified"
                 if use_gnss else "windowed_rgb_ba_unscaled_unverified"),
@@ -360,4 +414,10 @@ def adjust_windowed_unscaled_rgb_network(
         weighted_objective_after=global_current if use_gnss else None,
         rtk_windows_with_updates=updates if use_gnss else 0,
         rtk_windows_without_improvement=without_improvement if use_gnss else 0,
+        refined_intrinsics=(PinholeIntrinsics(*map(float, (
+            current_intrinsics.fx,current_intrinsics.fy,
+            current_intrinsics.cx,current_intrinsics.cy,
+        ))) if refine_focal else None),
+        focal_refined=bool(refine_focal and abs(np.log(current_intrinsics.fx/intrinsics.fx)) > 1.e-10),
+        focal_reference_intrinsics=focal_reference if refine_focal else None,
     )

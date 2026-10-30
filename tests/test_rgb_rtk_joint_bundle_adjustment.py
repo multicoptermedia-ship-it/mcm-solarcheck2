@@ -99,6 +99,8 @@ def test_rtk_weighted_window_ba_reuses_full_multiview_network_and_withholds_rtk(
     prior_original = priors.camera_enu_m.copy()
     answer = adjust_rgb_windowed_bundle_with_private_rtk(
         network,windowed,priors,k,windowed_options={"max_iterations": 5},
+        enforce_camera_p95=False,  # diagnostic candidate is NOT an accepted flight
+        enforce_parallax=False,
     )
     report = answer.privacy_safe_summary()
     assert answer.total_cameras == 12
@@ -113,6 +115,29 @@ def test_rtk_weighted_window_ba_reuses_full_multiview_network_and_withholds_rtk(
     assert answer.joint_objective_after <= answer.joint_objective_before + 1e-8
     assert answer.after_rtk_holdout_max_m < 2.
     assert np.isfinite(answer.after_reprojection_rmse_px)
+    assert answer.camera_reprojection_audit is not None
+    assert answer.camera_reprojection_audit.camera_count == 12
+    assert answer.camera_reprojection_audit.minimum_observations_per_camera >= 8
+    assert answer.camera_reprojection_audit.minimum_cameras_per_landmark >= 2
+    assert answer.camera_reprojection_audit.worst_camera_p95_px >= 0.
+    assert (report["per_camera_reprojection"]["camera_reprojection_quality_passed"]
+            == (answer.camera_reprojection_audit.cameras_above_p95_limit == 0))
+    if answer.camera_reprojection_audit.cameras_above_p95_limit:
+        assert answer.state == "rtk_camera_reprojection_quality_failed_unverified"
+    # The real synthetic Schur/RTK BA must reach the next vertical geometry
+    # stage and retain PRIVATE 3D hypotheses, without claiming roof success.
+    assert answer.pitched_plane_candidates is not None
+    assert answer.pitched_plane_candidates.landmark_count == len(
+        answer.landmarks_enu_private_m
+    )
+    assert report["pitched_plane_hypotheses"]["roof_geometry_verified"] is False
+    assert report["pitched_plane_hypotheses"]["orthophoto_verified"] is False
+    assert report["pitched_plane_hypotheses"]["independent_survey_verified"] is False
+    assert report["multiview_parallax"]["parallax_audit_completed"] is True
+    assert report["multiview_parallax"]["independent_survey_verified"] is False
+    assert report["multiview_parallax"]["roof_geometry_verified"] is False
+    assert report["per_camera_reprojection"]["camera_reprojection_audit_completed"]
+    assert report["per_camera_reprojection"]["orthophoto_verified"] is False
     assert answer.rtk_prior_windowed_ba_completed
     assert not answer.full_global_joint_ba_completed
     assert not answer.independent_survey_verified
@@ -176,3 +201,74 @@ def test_private_window_ba_rejects_identity_mismatch_and_user_overridden_holdout
         adjust_rgb_windowed_bundle_with_private_rtk(
             network,windowed,priors,k,should_cancel=lambda:True,
         )
+
+
+def test_strict_rtk_camera_reprojection_gate_rejects_bad_synthetic_window():
+    """A robust pixel+GNSS objective pass is NOT a per-camera quality pass."""
+    flight,network,windowed,k = _synthetic_full_rgb_flight()
+    priors = build_private_rtk_camera_priors(flight,network.frame_ids)
+    diagnostic = adjust_rgb_windowed_bundle_with_private_rtk(
+        network,windowed,priors,k,
+        windowed_options={"max_iterations": 5},
+        enforce_camera_p95=False,
+        enforce_parallax=False,
+    )
+    # The same synthetic fixture has known per-camera residual outliers:
+    # never silently accept this candidate in the full-flight/strict path.
+    assert diagnostic.camera_reprojection_audit.cameras_above_p95_limit >= 1
+    with pytest.raises(ValueError,match="individual RGB camera"):
+        adjust_rgb_windowed_bundle_with_private_rtk(
+            network,windowed,priors,k,
+            windowed_options={"max_iterations": 5},
+            enforce_camera_p95=True,
+        )
+
+
+def test_final_camera_audit_uses_fitted_focal_instead_of_nominal_camera(monkeypatch):
+    """The final strict pixel gate must evaluate the geometry with its fitted K."""
+    from mcm_solarcheck.services import rgb_rtk_joint_bundle_adjustment as service
+    from mcm_solarcheck.services.rgb_per_camera_reprojection_gate import (
+        audit_rgb_per_camera_reprojection,
+    )
+    flight, network, windowed, truth = _synthetic_full_rgb_flight()
+    priors = build_private_rtk_camera_priors(flight, network.frame_ids)
+    fid = network.observation_frame_indices
+    lid = network.observation_landmark_indices
+    poses = np.asarray(network.world_to_camera)
+    xyz = np.einsum("nij,nj->ni", poses[fid, :, :3],
+                    network.landmark_xyz_unit_baseline[lid]) + poses[fid, :, 3]
+    observed = np.column_stack((truth.fx * xyz[:, 0] / xyz[:, 2] + truth.cx,
+                                truth.fy * xyz[:, 1] / xyz[:, 2] + truth.cy))
+    network = replace(network, observation_pixels_xy=observed)
+    nominal = PinholeIntrinsics(.7 * truth.fx, .7 * truth.fy, truth.cx, truth.cy)
+
+    def fitted_window(metric_candidate, starting_camera, **options):
+        assert starting_camera == nominal
+        assert options["refine_focal"] is True
+        # Keep the real Sim(3)-aligned geometry and the real downstream pixel
+        # audit. Isolate the handoff of the fitted common camera from BA.
+        return replace(
+            windowed, world_to_camera=metric_candidate.world_to_camera,
+            landmark_xyz_unit_baseline=metric_candidate.landmark_xyz_unit_baseline,
+            rtk_camera_priors_optimized=True,
+            weighted_objective_before=1., weighted_objective_after=.5,
+            refined_intrinsics=truth, focal_refined=True,
+            focal_reference_intrinsics=nominal,
+        )
+
+    monkeypatch.setattr(service, "adjust_windowed_unscaled_rgb_network", fitted_window)
+    answer = adjust_rgb_windowed_bundle_with_private_rtk(
+        network, windowed, priors, nominal, refine_focal=True,
+        enforce_parallax=False,
+    )
+    assert answer.refined_intrinsics == truth
+    assert answer.focal_refined
+    assert answer.camera_reprojection_audit.cameras_above_p95_limit == 0
+    assert answer.camera_reprojection_audit.flight_max_px < 1.e-8
+    with pytest.raises(ValueError, match="individual RGB camera"):
+        audit_rgb_per_camera_reprojection(
+            answer.world_enu_to_camera_private, answer.landmarks_enu_private_m,
+            fid, lid, observed, nominal,
+        )
+    assert not answer.roof_geometry_verified
+    assert not answer.orthophoto_verified

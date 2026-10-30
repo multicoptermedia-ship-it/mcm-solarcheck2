@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import cv2
 import numpy as np
+from mcm_solarcheck.services.module_plane_projection import PinholeIntrinsics
 
 @dataclass(frozen=True)
 class RGBUnscaledBundleAdjustment:
@@ -23,6 +24,10 @@ class RGBUnscaledBundleAdjustment:
     roof_geometry_verified: bool = False
     orthophoto_verified: bool = False
     rtk_camera_priors_optimized: bool = False
+    refined_intrinsics: PinholeIntrinsics | None = None
+    focal_refined: bool = False
+    focal_information_fraction: float | None = None
+    focal_observable: bool = False
 
 
 def _projections(poses, points, camera_ids, landmark_ids, k):
@@ -54,12 +59,61 @@ def _robust_gnss_cost(poses, centers, sigmas, fitted, huber):
     return float(cost), whitened, norm
 
 
+def _focal_information_fraction(poses, points, fid, lid, pixels, k, first_variable_camera, huber):
+    """Pixel-only undamped focal information after eliminating pose/point DOFs.
+
+    This is a local degeneracy diagnostic, not independent calibration evidence.
+    GNSS penalties and LM damping deliberately do not make focal information.
+    """
+    transformed, projected = _projections(poses, points, fid, lid, k)
+    errors = np.linalg.norm(projected - pixels, axis=1)
+    pose_dof = 6 * (len(poses) - first_variable_camera)
+    reduced = np.zeros((pose_dof + 1, pose_dof + 1))
+    raw_focal_information = 0.
+    for landmark in range(len(points)):
+        hll = np.zeros((3, 3))
+        cross = np.zeros((pose_dof + 1, 3))
+        for ix in np.flatnonzero(lid == landmark):
+            i = int(fid[ix]); xc = transformed[ix]; z = xc[2]
+            jp = np.array([[k[0]/z, 0., -k[0]*xc[0]/z**2],
+                           [0., k[1]/z, -k[1]*xc[1]/z**2]])
+            jl = jp @ poses[i, :, :3]
+            jc = np.zeros((2, pose_dof + 1))
+            jc[:, -1] = (k[0]*xc[0]/z, k[1]*xc[1]/z)
+            if i >= first_variable_camera:
+                skew = np.array([[0., -xc[2], xc[1]],
+                                 [xc[2], 0., -xc[0]], [-xc[1], xc[0], 0.]])
+                sl = slice(6*(i-first_variable_camera), 6*(i-first_variable_camera+1))
+                jc[:, sl] = jp @ np.column_stack((-skew, np.eye(3)))
+            weight = min(1., huber / max(1.e-12, errors[ix]))
+            raw_focal_information += weight * float(jc[:, -1] @ jc[:, -1])
+            hll += weight * (jl.T @ jl)
+            cross += weight * (jc.T @ jl)
+            reduced += weight * (jc.T @ jc)
+        reduced -= cross @ np.linalg.pinv(hll, rcond=1.e-10) @ cross.T
+    reduced = .5 * (reduced + reduced.T)
+    diagonal = float(reduced[-1, -1])
+    # Normalize against information BEFORE point elimination. In a focal/depth
+    # gauge the eliminated diagonal is numerical cancellation around zero;
+    # dividing its marginal by that same tiny diagonal would spuriously report
+    # almost perfect observability, especially with all GNSS-mode poses free.
+    if (not np.isfinite(reduced).all() or raw_focal_information <= 1.e-12
+            or diagonal <= 1.e-12 * raw_focal_information):
+        return 0.
+    coupling = reduced[:-1, -1]
+    marginal = diagonal - float(coupling @ np.linalg.pinv(
+        reduced[:-1, :-1], rcond=1.e-10) @ coupling)
+    return float(np.clip(marginal / raw_focal_information, 0., 1.))
+
+
 def adjust_unscaled_rgb_bundle(
     network, intrinsics, *, max_iterations=12,
     max_cameras=12, max_landmarks=400, max_observations=4000,
     huber_threshold_px=2., should_cancel=None,
     camera_center_priors_m=None, camera_center_sigma_m=None,
     camera_prior_fit_mask=None, gnss_huber_sigma=3.,
+    refine_focal: bool = False,
+    focal_scale_bounds: tuple[float, float] = (.5, 2.),
 ):
     """Jointly refine *all selected* 3D landmarks and non-anchor camera poses.
 
@@ -69,20 +123,29 @@ def adjust_unscaled_rgb_bundle(
     reference frame is constrained by the GNSS penalty, NOT first-two anchors.
     A false fit mask explicitly withholds RTK values from the optimization.
     Neither version verifies surveying, 3D roofs, or an orthophoto.
+    Optional focal refinement jointly fits one log-scale for fx/fy; principal
+    point, aspect ratio and distortion remain fixed. This is not a complete
+    self-calibration model or proof that focal length is observable.
     """
     from mcm_solarcheck.services.rgb_global_camera_network import RGBUnscaledNetwork
     from mcm_solarcheck.services.module_plane_projection import PinholeIntrinsics
     if not isinstance(network, RGBUnscaledNetwork):
         raise TypeError("existing unscaled multi-view RGB network required")
     if not isinstance(intrinsics, PinholeIntrinsics):
-        raise TypeError("external calibrated RGB intrinsics required")
-    if (type(max_iterations) is not int or not 1 <= max_iterations <= 40
+        raise TypeError("RGB pinhole camera intrinsics required")
+    if (type(refine_focal) is not bool
+            or type(max_iterations) is not int or not 1 <= max_iterations <= 40
             or type(max_cameras) is not int or not 3 <= max_cameras <= 40
             or type(max_landmarks) is not int or not 8 <= max_landmarks <= 2000
             or type(max_observations) is not int or not 24 <= max_observations <= 20000
             or type(huber_threshold_px) not in (float, int)
             or not np.isfinite(huber_threshold_px) or not .1 <= huber_threshold_px <= 10):
         raise ValueError("invalid bounded global BA resource and Huber settings")
+    if (not isinstance(focal_scale_bounds, (tuple, list)) or len(focal_scale_bounds) != 2
+            or any(type(v) not in (int, float) or not np.isfinite(v) for v in focal_scale_bounds)
+            or not 0 < focal_scale_bounds[0] <= 1 <= focal_scale_bounds[1]
+            or focal_scale_bounds[0] >= focal_scale_bounds[1]):
+        raise ValueError("invalid bounded focal refinement scale")
     count = len(network.frame_ids)
     if not 3 <= count <= max_cameras or len(network.world_to_camera) != count:
         raise ValueError("global RGB camera network exceeds BA camera budget")
@@ -92,6 +155,8 @@ def adjust_unscaled_rgb_bundle(
     fid = np.asarray(network.observation_frame_indices)
     pixels = np.asarray(network.observation_pixels_xy, dtype=np.float64)
     k = np.asarray([intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy], dtype=np.float64)
+    initial_k = k.copy()
+    focal_log_scale = 0.
     if (points.ndim != 2 or points.shape[1] != 3
             or not 8 <= len(points) <= max_landmarks
             or cameras.shape != (count, 3, 4)
@@ -135,11 +200,13 @@ def adjust_unscaled_rgb_bundle(
     # Legacy unscaled SfM fixes the first two cameras. Metric-prior mode instead
     # optimizes ALL poses, including the first two, with a weighted ENU datum.
     first_variable_camera = 0 if use_gnss else 2
-    dof = 6 * (count - first_variable_camera)
+    pose_dof = 6 * (count - first_variable_camera)
+    dof = pose_dof + int(refine_focal)
     I3 = np.eye(3)
     by_landmark = [np.flatnonzero(lid == j) for j in range(len(points))]
-    def evaluate(pose_array, xyz):
-        transformed, projected = _projections(pose_array, xyz, fid, lid, k)
+    def evaluate(pose_array, xyz, camera_k=None):
+        transformed, projected = _projections(pose_array, xyz, fid, lid,
+                                               k if camera_k is None else camera_k)
         residual = projected - pixels
         norms = np.linalg.norm(residual, axis=1)
         h = float(huber_threshold_px)
@@ -181,6 +248,11 @@ def adjust_unscaled_rgb_bundle(
                 weight = min(1., float(huber_threshold_px)/max(1e-12,norms[ix]))
                 hll += weight*(jl.T@jl)
                 gl += weight*(jl.T@r)
+                if refine_focal:
+                    jf = np.array((k[0]*xc[0]/z, k[1]*xc[1]/z))
+                    hcc[-1, -1] += weight * float(jf @ jf)
+                    gcc[-1] += weight * float(jf @ r)
+                    cross[-1] += weight * (jf @ jl)
                 if i >= first_variable_camera:
                     skew = np.array([
                         [0.,-xc[2],xc[1]],
@@ -192,6 +264,10 @@ def adjust_unscaled_rgb_bundle(
                     hcc[sl,sl] += weight*(jc.T@jc)
                     gcc[sl] += weight*(jc.T@r)
                     cross[sl] += weight*(jc.T@jl)
+                    if refine_focal:
+                        coupling = weight * (jc.T @ jf)
+                        hcc[sl, -1] += coupling
+                        hcc[-1, sl] += coupling
             inv = np.linalg.inv(hll)
             hcc -= cross@inv@cross.T
             gcc -= cross@inv@gl
@@ -219,6 +295,15 @@ def adjust_unscaled_rgb_bundle(
                 raise ValueError("RGB global BA singular camera system") from error
         else:
             camera_delta = np.empty(0)
+        candidate_k = k.copy()
+        candidate_log_scale = focal_log_scale
+        if refine_focal:
+            candidate_log_scale = float(np.clip(
+                focal_log_scale + np.clip(camera_delta[-1], -.25, .25),
+                np.log(focal_scale_bounds[0]), np.log(focal_scale_bounds[1]),
+            ))
+            camera_delta[-1] = candidate_log_scale - focal_log_scale
+            candidate_k[:2] = initial_k[:2] * np.exp(candidate_log_scale)
         candidate_points = points.copy()
         for j in range(len(points)):
             candidate_points[j] -= inverse_blocks[j]@(
@@ -232,7 +317,7 @@ def adjust_unscaled_rgb_bundle(
             candidate_cameras[i,:,3] = rotation@cameras[i,:,3] + delta[3:]
         try:
             next_transformed,next_residual,next_norms,next_cost = evaluate(
-                candidate_cameras,candidate_points,
+                candidate_cameras,candidate_points,candidate_k,
             )
         except ValueError:
             damping *= 10.
@@ -240,6 +325,7 @@ def adjust_unscaled_rgb_bundle(
         if next_cost < cost:
             improvement = cost-next_cost
             points,cameras = candidate_points,candidate_cameras
+            k, focal_log_scale = candidate_k, candidate_log_scale
             transformed,residual,norms,cost = (
                 next_transformed,next_residual,next_norms,next_cost
             )
@@ -260,10 +346,18 @@ def adjust_unscaled_rgb_bundle(
     for p in cameras:
         p.setflags(write=False)
     points.setflags(write=False)
+    focal_information = (_focal_information_fraction(
+        cameras, points, fid, lid, pixels, k, first_variable_camera,
+        float(huber_threshold_px),
+    ) if refine_focal else None)
     return RGBUnscaledBundleAdjustment(
         tuple(p.copy() for p in cameras), points,
         before, after, len(fid), accepted,
         state=("rtk_regularized_window_schur_ba_candidate_unverified" if use_gnss
                else "global_bundle_adjustment_unscaled_unverified"),
         rtk_camera_priors_optimized=use_gnss,
+        refined_intrinsics=PinholeIntrinsics(*map(float, k)) if refine_focal else None,
+        focal_refined=bool(refine_focal and abs(focal_log_scale) > 1.e-10),
+        focal_information_fraction=focal_information,
+        focal_observable=bool(focal_information is not None and focal_information > 1.e-7),
     )

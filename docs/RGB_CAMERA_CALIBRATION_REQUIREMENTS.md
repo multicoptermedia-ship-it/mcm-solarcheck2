@@ -1,6 +1,6 @@
-# Externe RGB-Kamerakalibrierung – Anforderungen
+# Optionale externe RGB-Kamerakalibrierung – Anforderungen
 
-Stand: 30.10.2026. Nutzerentscheidung: **zuerst externe Kalibrierung beschaffen**, keinen neuen Selbstkalibrierungsmodus entwickeln. Maßgeblich bleibt [AKTUELLER_ENTWICKLUNGSSTAND.md](AKTUELLER_ENTWICKLUNGSSTAND.md).
+Stand: 30.10.2026. **Optionaler geprüfter Pfad, keine Voraussetzung für die normale RGB-Orthofoto-Entwicklung.** Der Nutzer hat die kurze vorherige Beschaffungsentscheidung ausdrücklich ersetzt: Die vorhandene Mehrbildpipeline wird ohne externe Kalibrierungsdatei mit ungeprüfter EXIF-Kamerainitialisierung und gemeinsamer Brennweitenoptimierung weiterentwickelt. Diese Datei bewahrt die Anforderungen für den Fall, dass später zusätzlich ein unabhängiger externer Nachweis beschafft wird. Maßgeblich bleibt [AKTUELLER_ENTWICKLUNGSSTAND.md](AKTUELLER_ENTWICKLUNGSSTAND.md).
 
 ## Welche Kamera und Bilder?
 
@@ -14,12 +14,12 @@ Die Kalibrierung muss zum konkreten Kameragerät, Objektiv und verwendeten Aufna
 | --- | --- |
 | Intrinsics | `fx`, `fy`, `cx`, `cy` in **Pixeln des 4000×3000-Originalrasters**, samt Koordinatenkonvention. Das bestehende Modell verwendet eine Kameramatrix ohne Scherung. |
 | Verzeichnung | Koeffizienten mit eindeutigem Modell, Reihenfolge und Konvention. Der bestehende OpenCV-Pfad unterstützt 4/5/8/12/14 Werte. |
-| Bildverarbeitung | Angabe, ob die ausgegebenen JPEGs bereits entzerrt sind und für welchen konkreten Bildzustand die Parameter gelten. Nullkoeffizienten nicht ohne Nachweis einsetzen. |
+| Bildverarbeitung | Angabe, ob die ausgegebenen JPEGs bereits entzerrt sind und für welchen konkreten Bildzustand die Parameter gelten. Im verifizierten externen Pfad Nullkoeffizienten nicht ohne Nachweis als geprüfte Werte einsetzen. Der automatische Kandidatenpfad nutzt Nullverzeichnung ausdrücklich nur als ungeprüfte Startannahme. |
 | Zuordnung | Welches Gerät/Objektiv und welcher Aufnahme-/Ausgabemodus wurden kalibriert? Für welche Auflösung gelten die Werte? |
 | Provenienz | Aussteller, Datum, Methode und nachvollziehbare Kalibrierungsunterlagen. |
 | Validierung | Dokumentierte Fehler-/Genauigkeitsbewertung und möglichst separate Prüfbilder oder ein unabhängiger Prüfbericht. Ein kleines Anpassungsresiduum der verwendeten Kalibrierbilder allein ist kein unabhängiger Nachweis. |
 
-Allgemeine Datenblatt-Brennweite, Kleinbildäquivalent, GNSS-/RTK-Daten, Gimbalwinkel oder die bloße Übereinstimmung der RGB-/Thermal-Bildnummern ersetzen diesen Nachweis nicht. Der aktuelle Bestand ist noch nicht photogrammetrisch rekonstruiert.
+Allgemeine Datenblatt-Brennweite, Kleinbildäquivalent, GNSS-/RTK-Daten, Gimbalwinkel oder die bloße Übereinstimmung der RGB-/Thermal-Bildnummern ersetzen diesen Nachweis nicht. Eine erfolgreiche vollständige Rekonstruktion des aktuellen Bestands ist noch nicht nachgewiesen. ORB-Läufe ohne externe Datei scheiterten am Track-/PnP-Stützungsproblem, nicht an einem externen Dateigate. Der gleiche Dienst/CLI nutzt nun SIFT als Standard (`--feature-method sift`, optional `orb`); der echte Lauf aller 295 RGB ist gestartet, Ergebnis noch offen. Vor der SIFT-Änderung bestanden 4.056 lokale Tests; anschließend 19 Pipeline-Tests einschließlich analytischer Texturbild-Matches bestanden. Neue vollständige HEAD-CI separat prüfen.
 
 ## Praktischer Beschaffungsweg
 
@@ -35,6 +35,6 @@ Es wurden keine Anbieter kontaktiert, Aufträge erteilt oder Kosten ausgelöst.
 
 ## Übernahme in SolarCheck 2
 
-Herstellerdatei, OpenCV-YAML/XML oder Bericht zunächst privat zur Prüfung bereitstellen. Niemand muss ungeprüft ein SolarCheck-JSON ausfüllen. Passt das Modell, werden die echten Werte nachvollziehbar in den vorhandenen Vertrag `mcm.rgb_camera_intrinsics_external.v1` übertragen. Der CLI liest derzeit ausschließlich dieses JSON; ein allgemeiner Hersteller-Konverter ist noch nicht vorhanden.
+Herstellerdatei, OpenCV-YAML/XML oder Bericht zunächst privat zur Prüfung bereitstellen. Niemand muss ungeprüft ein SolarCheck-JSON ausfüllen. Passt das Modell, werden die echten Werte nachvollziehbar in den vorhandenen Vertrag `mcm.rgb_camera_intrinsics_external.v1` übertragen. Der optionale CLI-Parameter `--calibration-json` liest dieses JSON; ohne ihn nutzt der bestehende Ganzflugpfad die automatische ungeprüfte Kamerainitialisierung. Ein allgemeiner Hersteller-Konverter ist noch nicht vorhanden.
 
-`lens_calibration_verified` darf erst bei tatsächlich geprüftem passenden Nachweis gesetzt werden. Keine Zahlen aus Beispieltests oder nominalen Millimeter-Brennweiten übernehmen und kein Prüfmerkmal zum Umgehen des Eingangsschutzes setzen. Erst danach die lokal vorbereitete vollständige RGB-Serie im bestehenden SfM-/RTK-BA-Pfad verarbeiten. Vermessungs-, Dach-/Orthofoto-, PV- und Thermal-Freigaben bleiben separate Gates.
+`lens_calibration_verified` darf erst bei tatsächlich geprüftem passenden Nachweis gesetzt werden. Keine Zahlen aus Beispieltests oder nominalen Millimeter-Brennweiten übernehmen und kein Prüfmerkmal zum Umgehen des Eingangsschutzes setzen. Dies ist ausschließlich die Bedingung für den **extern verifizierten** Pfad. Die lokal vorbereitete vollständige RGB-Serie darf im automatischen SfM-/RTK-BA-Kandidatenpfad bereits ohne diese Datei verarbeitet werden. Vermessungs-, Dach-/Orthofoto-, PV- und Thermal-Freigaben bleiben separate Gates.
