@@ -8,6 +8,8 @@ Die sichtbare vollständige Ordneransicht enthält 295 RGB-/287 Thermal-JPGs, 28
 
 Der Nutzer bestätigt, dass keine verifizierte Kamerakalibrierung vorliegt; im Ordner ist keine separate Kalibrierungsdatei sichtbar. Deshalb kein realer SfM-/BA-/Orthofotolauf und keine gefälschten Intrinsics oder Prüf-Flags. Der neue sichtbare Bestand ist größer als die historische 160er-Serie. Später die tatsächlichen vollständigen Eingaben verarbeiten; keinen Teilbestand passend zur alten Zahl auswählen. Bildnummernzuordnung ist keine geometrische Registrierung. Die darunterstehenden Zugriffsprobleme/Null-Run-Beobachtungen sind historische Schritte; aktueller fachlicher Blocker ist die Kalibrierungsgrundlage.
 
+**Ausdrückliche Nutzerentscheidung: zuerst externe Kalibrierung beschaffen.** Kein Selbstkalibrierungsmodus als nächste Aufgabe. Die konkrete Beschaffungs-/Prüfliste und ein kurzer Anfragetext stehen in [RGB_CAMERA_CALIBRATION_REQUIREMENTS.md](RGB_CAMERA_CALIBRATION_REQUIREMENTS.md). Die repräsentative Originaldatei bestätigt DJI M3T und 4000×3000; Parameter müssen zum tatsächlichen RGB-Gerät und Bildmodus passen. Noch keine Hersteller-/Labordatei vorhanden und keine kostenpflichtige Beauftragung oder Kontaktaufnahme erfolgt.
+
 Stand: 29.10.2026. Zuerst `AKTUELLER_ENTWICKLUNGSSTAND.md` lesen. Diese Datei ergänzt den übernommenen Checkpoint um die ausdrückliche Repository-Entscheidung des Nutzers und die Cloud-Einrichtung.
 
 ## Repository und übernommener Stand
