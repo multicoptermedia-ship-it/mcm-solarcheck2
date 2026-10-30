@@ -1,5 +1,13 @@
 # SolarCheck 2 – Entwicklung im eigenen Zielrepository
 
+## Aktueller Datenzugang am 30.10.2026
+
+Drive-Ordner und Originaldownloads sind inzwischen mit HTTP 200 erreichbar. Die gespeicherte Netzwerkeinstellung wirkt bereits, obwohl die UI die Snapshot-Veröffentlichung als fehlgeschlagen meldet. Die genaue Veröffentlichungsursache ist mangels verfügbarer Plattformlogs ungeklärt; nicht Linux oder eine fehlerhafte Ordnerfreigabe als Ursache behaupten. `pip check`, Offline-Smoke und beide gespeicherten Git-Refs wurden erneut erfolgreich geprüft.
+
+Die sichtbare vollständige Ordneransicht enthält 295 RGB-/287 Thermal-JPGs, 287 eindeutige Bildnummernpaare und 8 RGB ohne gelisteten Thermalpartner. Die Hauptseite zeigte nur 50 Einträge. Alle 295 RGB-Originale wurden außerhalb des Git-Checkouts unverändert heruntergeladen (2.214.162.432 Bytes), private SHA256-Nachweise gespeichert; ZIP-Staging für den vorhandenen Ganzflug-CLI ist mit allen 295 Originalen byteidentisch fertiggestellt, SHA256 beim Verpacken und ZIP-CRC geprüft. Ein zugehöriges Originalpaar wurde strukturell als 4000×3000 RGB / 640×512 Thermal geprüft. Keine Bilder, Dateinummern, privaten Links oder GPS in GitHub speichern. Keine erneute EXIF-/MPO-/ORB-Inventur.
+
+Der Nutzer bestätigt, dass keine verifizierte Kamerakalibrierung vorliegt; im Ordner ist keine separate Kalibrierungsdatei sichtbar. Deshalb kein realer SfM-/BA-/Orthofotolauf und keine gefälschten Intrinsics oder Prüf-Flags. Der neue sichtbare Bestand ist größer als die historische 160er-Serie. Später die tatsächlichen vollständigen Eingaben verarbeiten; keinen Teilbestand passend zur alten Zahl auswählen. Bildnummernzuordnung ist keine geometrische Registrierung. Die darunterstehenden Zugriffsprobleme/Null-Run-Beobachtungen sind historische Schritte; aktueller fachlicher Blocker ist die Kalibrierungsgrundlage.
+
 Stand: 29.10.2026. Zuerst `AKTUELLER_ENTWICKLUNGSSTAND.md` lesen. Diese Datei ergänzt den übernommenen Checkpoint um die ausdrückliche Repository-Entscheidung des Nutzers und die Cloud-Einrichtung.
 
 ## Repository und übernommener Stand
